@@ -1,13 +1,11 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
  *
  * For more information, see the README file.
  */
-
-#define NEWBOT 1
 
 /*
  * Standard include file for "less".
@@ -169,7 +167,7 @@ void free();
 #define IS_DIGIT(c)     ((c) >= '0' && (c) <= '9')
 #endif
 
-#define IS_CSI_START(c) (((LWCHAR)(c)) == ESC || (((LWCHAR)(c)) == CSI))
+#define IS_CSI_START(c) (control_char(c) && (((LWCHAR)(c)) == ESC || (((LWCHAR)(c)) == CSI)))
 
 #define OPT_OFF         0
 #define OPT_ON          1
@@ -218,7 +216,7 @@ void free();
  * Special types and constants.
  */
 typedef unsigned long LWCHAR;
-#if defined(MINGW) || (defined(_MSC_VER) && _MSC_VER >= 1500)
+#if defined(__MINGW32__) || (defined(_MSC_VER) && _MSC_VER >= 1500)
 typedef long long less_off_t;  /* __int64 */
 typedef struct _stat64 less_stat_t;
 #define less_fstat _fstat64
@@ -290,15 +288,6 @@ typedef off_t           LINENUM;
 #endif
 #endif
 
-/*
- * Does the shell treat "?" as a metacharacter?
- */
-#if MSDOS_COMPILER || OS2 || _OSK
-#define SHELL_META_QUEST 0
-#else
-#define SHELL_META_QUEST 1
-#endif
-
 #define SPACES_IN_FILENAMES 1
 
 /*
@@ -364,6 +353,14 @@ typedef short POLL_EVENTS;
 #define NUM_FRAC_DENOM                  1000000
 #define NUM_LOG_FRAC_DENOM              6
 
+/*
+ * Max expected reasonable duration of a paste.
+ * Increasing this value avoids accidentally reenabling unwanted paste input 
+ * in the middle of a very long paste but risks apparently frozen UI if the 
+ * end bracket is missing.
+ */
+#define MAX_PASTE_IGNORE_SEC            5
+
 /* How quiet should we be? */
 #define NOT_QUIET       0       /* Ring bell at eof and for errors */
 #define LITTLE_QUIET    1       /* Ring bell only for errors */
@@ -392,13 +389,29 @@ typedef short POLL_EVENTS;
 #define SRCH_FILTER     (1 << 13) /* Search is for '&' (filter) command */
 #define SRCH_AFTER_TARGET (1 << 14) /* Start search after the target line */
 #define SRCH_WRAP       (1 << 15) /* Wrap-around search (continue at BOF/EOF) */
-#define SRCH_SUBSEARCH(i) (1 << (16+(i))) /* Search for subpattern */
+#if OSC8_LINK
+#define SRCH_OSC8       (1 << 16) /* */
+#endif
+#define SRCH_SUBSEARCH(i) (1 << (17+(i))) /* Search for subpattern */
 /* {{ Depends on NUM_SEARCH_COLORS==5 }} */
 #define SRCH_SUBSEARCH_ALL (SRCH_SUBSEARCH(1)|SRCH_SUBSEARCH(2)|SRCH_SUBSEARCH(3)|SRCH_SUBSEARCH(4)|SRCH_SUBSEARCH(5))
 
 #define SRCH_REVERSE(t) (((t) & SRCH_FORW) ? \
                                 (((t) & ~SRCH_FORW) | SRCH_BACK) : \
                                 (((t) & ~SRCH_BACK) | SRCH_FORW))
+/* Parsing position in an OSC8 link: "\e]8;PARAMS;URI\e\\" (final "\e\\" may be "\7") */
+typedef enum osc8_state {
+	OSC_START,    /* Waiting for initial \e */
+	OSC_INTRO,    /* Waiting for intro char, usually ']' */
+	OSC_TYPENUM,  /* Reading OS command type */
+	OSC_STRING,   /* Reading OS command string */
+	OSC_END_CSI,  /* Waiting for backslash after the final ESC. */
+	OSC_END,      /* At end */
+
+	OSC8_PARAMS,  /* In the OSC8 parameters */
+	OSC8_URI,     /* In the OSC8 URI */
+	OSC8_NOT,     /* This is not an OSC8 link */
+} osc8_state;
 
 /* */
 #define NO_MCA          0
@@ -410,7 +423,8 @@ typedef short POLL_EVENTS;
 #define CC_ERROR        2       /* Char could not be accepted due to error */
 #define CC_PASS         3       /* Char was rejected (internal) */
 
-#define CF_QUIT_ON_ERASE 0001   /* Abort cmd if its entirely erased */
+#define CF_QUIT_ON_ERASE (1<<0) /* Abort cmd if its entirely erased */
+#define CF_OPTION        (1<<1) /* A_OPT_TOGGLE */
 
 /* Special char bit-flags used to tell put_line() to do something special */
 #define AT_NORMAL       (0)
@@ -421,6 +435,7 @@ typedef short POLL_EVENTS;
 #define AT_ANSI         (1 << 4)  /* Content-supplied "ANSI" escape sequence */
 #define AT_BINARY       (1 << 5)  /* LESS*BINFMT representation */
 #define AT_HILITE       (1 << 6)  /* Internal highlights (e.g., for search) */
+#define AT_PLACEHOLDER  (1 << 7)  /* Placeholder for half of double-wide char */
 
 #define AT_COLOR_SHIFT    8
 #define AT_NUM_COLORS     16
@@ -449,10 +464,21 @@ typedef enum {
 	CV_ERROR    = -1
 } COLOR_VALUE;
 
+typedef enum {
+	CATTR_NULL       = 0,
+	CATTR_STANDOUT   = (1 << 0),
+	CATTR_BOLD       = (1 << 1),
+	CATTR_UNDERLINE  = (1 << 2),
+	CATTR_BLINK      = (1 << 3),
+} CHAR_ATTR;
+
 /* ANSI states */
-#define ANSI_MID    1
-#define ANSI_ERR    2
-#define ANSI_END    3
+typedef enum {
+	ANSI_NULL,
+	ANSI_MID,
+	ANSI_ERR,
+	ANSI_END,
+} ansi_state;
 
 #if '0' == 240
 #define IS_EBCDIC_HOST 1
@@ -529,6 +555,8 @@ typedef enum {
 #define ESC             CONTROL('[')
 #define ESCS            "\33"
 #define CSI             ((unsigned char)'\233')
+#define VARSEL_15       ((LWCHAR)0xFE0E)  /* VARIATION SELECTOR 15 */
+#define VARSEL_16       ((LWCHAR)0xFE0F)  /* VARIATION SELECTOR 16 */
 
 #if _OSK_MWC32
 #define LSIGNAL(sig,func)       os9_signal(sig,func)
@@ -550,10 +578,11 @@ typedef enum {
 #endif
 #endif
 
-#define S_INTERRUPT     01
-#define S_STOP          02
-#define S_WINCH         04
-#define ABORT_SIGS()    (sigs & (S_INTERRUPT|S_STOP))
+#define S_INTERRUPT     (1<<0)
+#define S_SWINTERRUPT   (1<<1)
+#define S_STOP          (1<<2)
+#define S_WINCH         (1<<3)
+#define ABORT_SIGS()    (sigs & (S_INTERRUPT|S_SWINTERRUPT|S_STOP))
 
 #ifdef EXIT_SUCCESS
 #define QUIT_OK         EXIT_SUCCESS
@@ -578,6 +607,7 @@ typedef enum {
 #define CH_POPENED      004
 #define CH_HELPFILE     010
 #define CH_NODATA       020     /* Special case for zero length files */
+#define CH_NOTRUSTSIZE  040     /* For files that claim 0 length size falsely */
 
 #define ch_zero()       ((POSITION)0)
 
@@ -601,6 +631,7 @@ typedef enum {
 #define X11MOUSE_BUTTON2    1 /* Middle button press */
 #define X11MOUSE_BUTTON3    2 /* Right button press */
 #define X11MOUSE_BUTTON_REL 3 /* Button release */
+#define X11MOUSE_DRAG       0x20 /* Drag with button down */
 #define X11MOUSE_WHEEL_UP   0x40 /* Wheel scroll up */
 #define X11MOUSE_WHEEL_DOWN 0x41 /* Wheel scroll down */
 #define X11MOUSE_OFFSET     0x20 /* Added to button & pos bytes to create a char */
@@ -617,6 +648,7 @@ typedef enum {
 #define SF_SHELL            (1<<9)  /* Shell command (!) */
 #define SF_STOP             (1<<10) /* Stop signal */
 #define SF_TAGS             (1<<11) /* Tags */
+#define SF_OSC8_OPEN        (1<<12) /* OSC8 open */
 
 #if LESSTEST
 #define LESS_DUMP_CHAR CONTROL(']')

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -30,6 +30,7 @@ extern int sc_width;
 extern int so_s_width, so_e_width;
 extern int is_tty;
 extern int oldbot;
+extern int utf_mode;
 extern char intr_char;
 
 #if MSDOS_COMPILER==WIN32C || MSDOS_COMPILER==BORLANDC || MSDOS_COMPILER==DJGPPC
@@ -48,7 +49,7 @@ extern int vt_enabled;
 /*
  * Display the line which is in the line buffer.
  */
-public void put_line(void)
+public void put_line(lbool forw_scroll)
 {
 	int c;
 	size_t i;
@@ -74,10 +75,18 @@ public void put_line(void)
 		else
 			putchr(c);
 	}
-
 	at_exit();
+
+	if (forw_scroll && should_clear_after_line())
+		clear_eol();
 }
 
+/*
+ * win_flush has at least one non-critical issue when an escape sequence
+ * begins at the last char of the buffer, and possibly more issues.
+ * as a temporary measure to reduce likelyhood of encountering end-of-buffer
+ * issues till the SGR parser is replaced, OUTBUF_SIZE is 8K on Windows.
+ */
 static char obuf[OUTBUF_SIZE];
 static char *ob = obuf;
 static int outfd = 2; /* stderr */
@@ -113,7 +122,8 @@ typedef struct t_sgr {
 
 static constant t_sgr SGR_DEFAULT; /* = {0} */
 
-static void update_sgr(t_sgr *sgr, long code)
+/* returns 0 on success, non-0 on unknown SGR code */
+static int update_sgr(t_sgr *sgr, long code)
 {
 	switch (code)
 	{
@@ -150,7 +160,11 @@ static void update_sgr(t_sgr *sgr, long code)
 	case 44: case 45: case 46: case 47:
 		sgr->bg = C_ANSI(code - 40);
 		break;
+	default:
+		return 1;
 	}
+
+	return 0;
 }
 
 static void set_win_colors(t_sgr *sgr)
@@ -230,8 +244,17 @@ static void set_win_colors(t_sgr *sgr)
 	WIN32setcolors(fg, bg);
 }
 
+/* like is_ansi_end, but doesn't assume c != 0  (returns 0 for c == 0) */
+static lbool is_ansi_end_0(char c)
+{
+	return c != '\0' && is_ansi_end((unsigned char)c);
+}
+
 static void win_flush(void)
 {
+#if MSDOS_COMPILER != WIN32C
+	static constant int vt_enabled = 0;
+#endif
 	if (ctldisp != OPT_ONPLUS || (vt_enabled && sgr_mode))
 		WIN32textout(obuf, ptr_diff(ob, obuf));
 	else
@@ -244,12 +267,35 @@ static void win_flush(void)
 		char *anchor, *p, *p_next;
 		static t_sgr sgr;
 
+		/* when unsupported SGR value is encountered, like 38/48 for
+		 * 256/true colors, then we abort processing this sequence,
+		 * because it may expect followup values, but we don't know
+		 * how many, so we've lost sync of this sequence parsing.
+		 * Without VT enabled it's OK because we can't do much anyway,
+		 * but with VT enabled we choose to passthrough this sequence
+		 * to the terminal - which can handle it better than us.
+		 * however, this means that our "sgr" var is no longer in sync
+		 * with the actual terminal state, which can lead to broken
+		 * colors with future sequences which we _can_ fully parse.
+		 * in such case, once it happens, we keep passthrough sequences
+		 * until we know we're in sync again - on a valid reset.
+		 */
+		static int sgr_bad_sync;
+
 		for (anchor = p_next = obuf;
 			 (p_next = memchr(p_next, ESC, ob - p_next)) != NULL; )
 		{
 			p = p_next;
 			if (p[1] == '[')  /* "ESC-[" sequence */
 			{
+				/*
+				* unknown SGR code ignores the rest of the seq,
+				* and allows ignoring sequences such as
+				* ^[[38;5;123m or ^[[38;2;5;6;7m
+				* (prior known codes at the same seq do apply)
+				*/
+				int bad_code = 0;
+
 				if (p > anchor)
 				{
 					/*
@@ -261,7 +307,7 @@ static void win_flush(void)
 					anchor = p;
 				}
 				p += 2;  /* Skip the "ESC-[" */
-				if (is_ansi_end(*p))
+				if (is_ansi_end_0(*p))
 				{
 					/*
 					 * Handle null escape sequence
@@ -271,6 +317,7 @@ static void win_flush(void)
 					anchor = p_next = p;
 					update_sgr(&sgr, 0);
 					set_win_colors(&sgr);
+					sgr_bad_sync = 0;
 					continue;
 				}
 				p_next = p;
@@ -279,7 +326,7 @@ static void win_flush(void)
 				 * Parse and apply SGR values to the SGR state
 				 * based on the escape sequence. 
 				 */
-				while (!is_ansi_end(*p))
+				while (!is_ansi_end_0(*p))
 				{
 					char *q;
 					long code = strtol(p, &q, 10);
@@ -292,29 +339,46 @@ static void win_flush(void)
 						 * in the buffer.
 						 */
 						size_t slop = ptr_diff(q, anchor);
-						/* {{ strcpy args overlap! }} */
-						strcpy(obuf, anchor);
+						memmove(obuf, anchor, slop);
 						ob = &obuf[slop];
 						return;
 					}
 
 					if (q == p ||
-						code > 49 || code < 0 ||
-						(!is_ansi_end(*q) && *q != ';'))
+						(!is_ansi_end_0(*q) && *q != ';'))
 					{
+						/*
+						 * can't parse. passthrough
+						 * till the end of the buffer
+						 */
 						p_next = q;
 						break;
 					}
 					if (*q == ';')
 						q++;
 
-					update_sgr(&sgr, code);
+					if (!bad_code)
+						bad_code = update_sgr(&sgr, code);
+
+					if (bad_code)
+						sgr_bad_sync = 1;
+					else if (code == 0)
+						sgr_bad_sync = 0;
+
 					p = q;
 				}
-				if (!is_ansi_end(*p) || p == p_next)
+				if (!is_ansi_end_0(*p) || p == p_next)
 					break;
 
-				set_win_colors(&sgr);
+				if (sgr_bad_sync && vt_enabled) {
+					/* this or a prior sequence had unknown
+					 * SGR value. passthrough all sequences
+					 * until we're in-sync again
+					 */
+					WIN32textout(anchor, ptr_diff(p+1, anchor));
+				} else {
+					set_win_colors(&sgr);
+				}
 				p_next = anchor = p + 1;
 			} else
 				p_next++;
@@ -529,6 +593,7 @@ IPRINT_FUNC(iprint_linenum, LINENUM, linenumtoa)
 public int less_printf(constant char *fmt, PARG *parg)
 {
 	constant char *s;
+	constant char *es;
 	int col;
 
 	col = 0;
@@ -545,11 +610,17 @@ public int less_printf(constant char *fmt, PARG *parg)
 			{
 			case 's':
 				s = parg->p_string;
+				es = s + strlen(s);
 				parg++;
 				while (*s != '\0')
 				{
-					putchr(*s++);
-					col++;
+					LWCHAR ch = step_charc(&s, +1, es);
+					constant char *ps = utf_mode ? prutfchar(ch) : prchar(ch);
+					while (*ps != '\0')
+					{
+						putchr(*ps++);
+						col++;
+					}
 				}
 				break;
 			case 'd':
@@ -675,8 +746,11 @@ public void ixerror(constant char *fmt, PARG *parg)
 	if (!supports_ctrl_x())
 		ierror(fmt, parg);
 	else
-		ierror_suffix(fmt, parg,
-			"... (", prchar((LWCHAR) intr_char), " or interrupt to abort)");
+	{
+		char ichar[MAX_PRCHAR_LEN+1];
+		strcpy(ichar, prchar((LWCHAR) intr_char));
+		ierror_suffix(fmt, parg, "... (", ichar, " or interrupt to abort)");
+	}
 }
 
 /*

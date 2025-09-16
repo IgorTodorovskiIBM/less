@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -26,6 +26,7 @@ static int table_size = 0;
 
 extern int sc_width, sc_height;
 extern int hshift;
+extern int shell_lines;
 
 /*
  * Return the starting file position of a line displayed on the screen.
@@ -46,6 +47,9 @@ public POSITION position(int sindex)
 	case BOTTOM_PLUS_ONE:
 		sindex = sc_height - 1;
 		break;
+	case BOTTOM_OFFSET:
+		sindex = sc_height - shell_lines;
+		break;
 	case MIDDLE:
 		sindex = (sc_height - 1) / 2;
 		break;
@@ -56,15 +60,18 @@ public POSITION position(int sindex)
 /*
  * Add a new file position to the bottom of the position table.
  */
-public void add_forw_pos(POSITION pos)
+public void add_forw_pos(POSITION pos, lbool no_scroll)
 {
 	int i;
 
 	/*
 	 * Scroll the position table up.
 	 */
-	for (i = 1;  i < sc_height;  i++)
-		table[i-1] = table[i];
+	if (!no_scroll)
+	{
+		for (i = 1;  i < sc_height;  i++)
+			table[i-1] = table[i];
+	}
 	table[sc_height - 1] = pos;
 }
 
@@ -256,7 +263,7 @@ static int pos_shift(POSITION linepos, size_t choff)
 		return -1;
 	cvt_ops = get_cvt_ops(0); /* {{ Passing 0 ignores SRCH_NO_REGEX; does it matter? }} */
 	/* {{ It would be nice to be able to call cvt_text with dst=NULL, to avoid need to alloc a useless cline. }} */
-	cline = (char *) ecalloc(1, line_len+1);
+	cline = (char *) ecalloc(1, cvt_length(line_len, cvt_ops));
 	cvt_text(cline, line, NULL, &line_len, cvt_ops);
 	free(cline);
 	return (int) line_len;  /*{{type-issue}}*/

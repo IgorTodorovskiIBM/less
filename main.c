@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -17,13 +17,15 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#if defined(MINGW) || defined(_MSC_VER)
+#if defined(__MINGW32__) || defined(_MSC_VER)
 #include <locale.h>
 #include <shellapi.h>
 #endif
 
 public unsigned less_acp = CP_ACP;
 #endif
+
+#include "option.h"
 
 public char *   every_first_cmd = NULL;
 public lbool    new_file;
@@ -35,8 +37,9 @@ public POSITION start_attnpos = NULL_POSITION;
 public POSITION end_attnpos = NULL_POSITION;
 public int      wscroll;
 public constant char *progname;
-public int      quitting;
+public lbool    quitting = FALSE;
 public int      dohelp;
+public char *   init_header = NULL;
 static int      secure_allow_features;
 
 #if LOGFILE
@@ -56,22 +59,26 @@ extern char *   tagoption;
 extern int      jump_sline;
 #endif
 
+#if HAVE_TIME
+public time_type less_start_time;
+#endif
+
 #ifdef WIN32
-static char consoleTitle[256];
+static wchar_t consoleTitle[256];
 #endif
 
 public int      one_screen;
 extern int      less_is_more;
-extern int      missing_cap;
+extern lbool    missing_cap;
 extern int      know_dumb;
 extern int      quit_if_one_screen;
 extern int      no_init;
 extern int      errmsgs;
 extern int      redraw_on_quit;
 extern int      term_init_done;
-extern int      first_time;
+extern lbool    first_time;
 
-#if MSDOS_COMPILER==WIN32C && (defined(MINGW) || defined(_MSC_VER))
+#if MSDOS_COMPILER==WIN32C && (defined(__MINGW32__) || defined(_MSC_VER))
 /* malloc'ed 0-terminated utf8 of 0-terminated wide ws, or null on errors */
 static char *utf8_from_wide(constant wchar_t *ws)
 {
@@ -88,7 +95,9 @@ static char *utf8_from_wide(constant wchar_t *ws)
 /*
  * similar to using UTF8 manifest to make the ANSI APIs UTF8, but dynamically
  * with setlocale. unlike the manifest, argv and environ are already ACP, so
- * make them UTF8. CP_ACP remains the original codepage - use less_acp instead.
+ * make them UTF8. Additionally, this affects only the libc/crt API, and so
+ * e.g. fopen filename becomes UTF-8, but CreateFileA filename remains CP_ACP.
+ * CP_ACP remains the original codepage - use the dynamic less_acp instead.
  * effective on win 10 1803 or later when compiled with ucrt, else no-op.
  */
 static void try_utf8_locale(int *pargc, constant char ***pargv)
@@ -147,6 +156,7 @@ cleanup:
 }
 #endif
 
+#if !SECURE
 static int security_feature_error(constant char *type, size_t len, constant char *name)
 {
 	PARG parg;
@@ -173,6 +183,7 @@ static int security_feature(constant char *name, size_t len)
 		{ "lesskey",  SF_LESSKEY },
 		{ "lessopen", SF_LESSOPEN },
 		{ "logfile",  SF_LOGFILE },
+		{ "osc8",     SF_OSC8_OPEN },
 		{ "pipe",     SF_PIPE },
 		{ "shell",    SF_SHELL },
 		{ "stop",     SF_STOP },
@@ -194,6 +205,7 @@ static int security_feature(constant char *name, size_t len)
 		return security_feature_error("invalid", len, name);
 	return features[match].sf_value;
 }
+#endif /* !SECURE */
 
 /*
  * Set the secure_allow_features bitmask, which controls
@@ -235,8 +247,14 @@ int main(int argc, constant char *argv[])
 {
 	IFILE ifile;
 	constant char *s;
+	int i;
+	struct xbuffer xfiles;
+	constant int *files;
+	size_t num_files;
+	lbool end_opts = FALSE;
+	lbool posixly_correct = FALSE;
 
-#if MSDOS_COMPILER==WIN32C && (defined(MINGW) || defined(_MSC_VER))
+#if MSDOS_COMPILER==WIN32C && (defined(__MINGW32__) || defined(_MSC_VER))
 	if (GetACP() != CP_UTF8)  /* not using a UTF-8 manifest */
 		try_utf8_locale(&argc, &argv);
 #endif
@@ -269,7 +287,8 @@ int main(int argc, constant char *argv[])
 			putenv(env);
 		}
 	}
-	GetConsoleTitle(consoleTitle, sizeof(consoleTitle)/sizeof(char));
+	/* on failure, consoleTitle is already a valid empty string */
+	GetConsoleTitleW(consoleTitle, countof(consoleTitle));
 #endif /* WIN32 */
 
 	/*
@@ -290,7 +309,8 @@ int main(int argc, constant char *argv[])
 	 * If the name of the executable program is "more",
 	 * act like LESS_IS_MORE is set.
 	 */
-	if (strcmp(last_component(progname), "more") == 0)
+	if (strcmp(last_component(progname), "more") == 0 &&
+			isnullenv(lgetenv("LESS_IS_MORE")))
 		less_is_more = 1;
 
 	init_prompt();
@@ -298,16 +318,23 @@ int main(int argc, constant char *argv[])
 	init_unsupport();
 	s = lgetenv(less_is_more ? "MORE" : "LESS");
 	if (s != NULL)
-		scan_option(s);
+		scan_option(s, TRUE);
 
 #define isoptstring(s)  (((s)[0] == '-' || (s)[0] == '+') && (s)[1] != '\0')
-	while (argc > 0 && (isoptstring(*argv) || isoptpending()))
+	xbuf_init(&xfiles);
+	posixly_correct = (getenv("POSIXLY_CORRECT") != NULL);
+	for (i = 0;  i < argc;  i++)
 	{
-		s = *argv++;
-		argc--;
-		if (strcmp(s, "--") == 0)
-			break;
-		scan_option(s);
+		if (strcmp(argv[i], "--") == 0)
+			end_opts = TRUE;
+		else if (!end_opts && (isoptstring(argv[i]) || isoptpending()))
+			scan_option(argv[i], FALSE);
+		else
+		{
+			if (posixly_correct)
+				end_opts = TRUE;
+			xbuf_add_data(&xfiles, (constant unsigned char *) &i, sizeof(i));
+		}
 	}
 #undef isoptstring
 
@@ -326,7 +353,7 @@ int main(int argc, constant char *argv[])
 
 #if EDITOR
 	editor = lgetenv("VISUAL");
-	if (editor == NULL || *editor == '\0')
+	if (isnullenv(editor))
 	{
 		editor = lgetenv("EDITOR");
 		if (isnullenv(editor))
@@ -344,7 +371,9 @@ int main(int argc, constant char *argv[])
 	ifile = NULL_IFILE;
 	if (dohelp)
 		ifile = get_ifile(FAKE_HELPFILE, ifile);
-	while (argc-- > 0)
+	files = (constant int *) xfiles.data;
+	num_files = xfiles.end / sizeof(int);
+	for (i = 0;  i < num_files;  i++)
 	{
 #if (MSDOS_COMPILER && MSDOS_COMPILER != DJGPPC)
 		/*
@@ -358,7 +387,7 @@ int main(int argc, constant char *argv[])
 		char *gfilename;
 		char *qfilename;
 		
-		gfilename = lglob(*argv++);
+		gfilename = lglob(argv[files[i]]);
 		init_textlist(&tlist, gfilename);
 		filename = NULL;
 		while ((filename = forw_textlist(&tlist, filename)) != NULL)
@@ -370,10 +399,12 @@ int main(int argc, constant char *argv[])
 		}
 		free(gfilename);
 #else
-		(void) get_ifile(*argv++, ifile);
+		(void) get_ifile(argv[files[i]], ifile);
 		ifile = prev_ifile(NULL_IFILE);
 #endif
 	}
+	xbuf_deinit(&xfiles);
+
 	/*
 	 * Set up terminal, etc.
 	 */
@@ -399,6 +430,9 @@ int main(int argc, constant char *argv[])
 	open_getchr();
 	raw_mode(1);
 	init_signals(1);
+#if HAVE_TIME
+	less_start_time = get_time();
+#endif
 
 	/*
 	 * Select the first file to examine.
@@ -446,6 +480,12 @@ int main(int argc, constant char *argv[])
 				one_screen = get_one_screen();
 		}
 	}
+	if (init_header != NULL)
+	{
+		opt_header(TOGGLE, init_header);
+		free(init_header);
+		init_header = NULL;
+	}
 
 	if (errmsgs > 0)
 	{
@@ -470,13 +510,17 @@ int main(int argc, constant char *argv[])
  * Copy a string to a "safe" place
  * (that is, to a buffer allocated by calloc).
  */
+public char * saven(constant char *s, size_t n)
+{
+	char *p = (char *) ecalloc(n+1, sizeof(char));
+	strncpy(p, s, n);
+	p[n] = '\0';
+	return (p);
+}
+
 public char * save(constant char *s)
 {
-	char *p;
-
-	p = (char *) ecalloc(strlen(s)+1, sizeof(char));
-	strcpy(p, s);
-	return (p);
+	return saven(s, strlen(s));
 }
 
 public void out_of_memory(void)
@@ -563,7 +607,7 @@ public void quit(int status)
 		status = save_status;
 	else
 		save_status = status;
-	quitting = 1;
+	quitting = TRUE;
 	check_altpipe_error();
 	if (interactive())
 		clear_bot();
@@ -576,7 +620,7 @@ public void quit(int status)
 		 * alternate screen, which now (since deinit) cannot be seen.
 		 * redraw_on_quit tells us to redraw it on the main screen.
 		 */
-		first_time = 1; /* Don't print "skipping" or tildes */
+		first_time = TRUE; /* Don't print "skipping" or tildes */
 		repaint();
 		flush();
 	}
@@ -593,7 +637,7 @@ public void quit(int status)
 	close(2);
 #endif
 #ifdef WIN32
-	SetConsoleTitle(consoleTitle);
+	SetConsoleTitleW(consoleTitle);
 #endif
 	close_getchr();
 	exit(status);

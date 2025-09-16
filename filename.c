@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -127,15 +127,24 @@ static constant char * metachars(void)
 /*
  * Is this a shell metacharacter?
  */
-static int metachar(char c)
+static lbool metachar(char c)
 {
 	return (strchr(metachars(), c) != NULL);
 }
 
 /*
+ * Must use quotes rather than escape char for this metachar?
+ */
+static lbool must_quote(char c)
+{
+	/* {{ Maybe the set of must_quote chars should be configurable? }} */
+	return (c == '\n'); 
+}
+
+/*
  * Insert a backslash before each metacharacter in a string.
  */
-public char * shell_quote(constant char *s)
+public char * shell_quoten(constant char *s, size_t slen)
 {
 	constant char *p;
 	char *np;
@@ -150,7 +159,7 @@ public char * shell_quote(constant char *s)
 	 * Determine how big a string we need to allocate.
 	 */
 	len = 1; /* Trailing null byte */
-	for (p = s;  *p != '\0';  p++)
+	for (p = s;  p < s + slen;  p++)
 	{
 		len++;
 		if (*p == openquote || *p == closequote)
@@ -164,6 +173,9 @@ public char * shell_quote(constant char *s)
 				 * doesn't support escape chars.  Use quotes.
 				 */
 				use_quotes = TRUE;
+			} else if (must_quote(*p))
+			{
+				len += 3; /* open quote + char + close quote */
 			} else
 			{
 				/*
@@ -180,7 +192,7 @@ public char * shell_quote(constant char *s)
 			 * We can't quote a string that contains quotes.
 			 */
 			return (NULL);
-		len = strlen(s) + 3;
+		len = slen + 3;
 	}
 	/*
 	 * Allocate and construct the new string.
@@ -188,24 +200,37 @@ public char * shell_quote(constant char *s)
 	newstr = np = (char *) ecalloc(len, sizeof(char));
 	if (use_quotes)
 	{
-		SNPRINTF3(newstr, len, "%c%s%c", openquote, s, closequote);
+		SNPRINTF4(newstr, len, "%c%.*s%c", openquote, (int) slen, s, closequote);
 	} else
 	{
-		while (*s != '\0')
+		constant char *es = s + slen;
+		while (s < es)
 		{
-			if (metachar(*s))
+			if (!metachar(*s))
 			{
-				/*
-				 * Add the escape char.
-				 */
+				*np++ = *s++;
+			} else if (must_quote(*s))
+			{
+				/* Surround the char with quotes. */
+				*np++ = openquote;
+				*np++ = *s++;
+				*np++ = closequote;
+			} else
+			{
+				/* Insert an escape char before the char. */
 				strcpy(np, esc);
 				np += esclen;
+				*np++ = *s++;
 			}
-			*np++ = *s++;
 		}
 		*np = '\0';
 	}
 	return (newstr);
+}
+
+public char * shell_quote(constant char *s)
+{
+	return shell_quoten(s, strlen(s));
 }
 
 /*
@@ -263,7 +288,7 @@ public char * homefile(constant char *filename)
 	if (pathname != NULL)
 		return (pathname);
 #endif
-#if MSDOS_COMPILER || OS2
+#if (MSDOS_COMPILER && MSDOS_COMPILER!=WIN32C) || OS2
 	/* Look for the file anywhere on search path. */
 	pathname = (char *) ecalloc(_MAX_PATH, sizeof(char));
 #if MSDOS_COMPILER==DJGPPC
@@ -284,6 +309,69 @@ public char * homefile(constant char *filename)
 	return (NULL);
 }
 
+typedef struct xcpy { char *dest; size_t copied; } xcpy;
+
+static void xcpy_char(xcpy *xp, char ch)
+{
+	if (xp->dest != NULL) *(xp->dest)++ = ch; 
+	xp->copied++;
+}
+
+static void xcpy_filename(xcpy *xp, constant char *str)
+{
+	/* If filename contains spaces, quote it 
+	 * to prevent edit_list from splitting it. */
+	lbool quote = (strchr(str, ' ') != NULL);
+	if (quote)
+		xcpy_char(xp, openquote);
+	for (;  *str != '\0';  str++)
+		xcpy_char(xp, *str);
+	if (quote)
+		xcpy_char(xp, closequote);
+}
+
+static size_t fexpand_copy(constant char *fr, char *to)
+{
+	xcpy xp;
+	xp.copied = 0;
+	xp.dest = to;
+
+	for (;  *fr != '\0';  fr++)
+	{
+		lbool expand = FALSE;
+		switch (*fr)
+		{
+		case '%':
+		case '#':
+			if (fr[1] == *fr)
+			{
+				/* Two identical chars. Output just one. */
+				fr += 1;
+			} else 
+			{
+				/* Single char. Expand to a (quoted) file name. */
+				expand = TRUE;
+			}
+			break;
+		default:
+			break;
+		}
+		if (expand)
+		{
+			IFILE ifile = (*fr == '%') ? curr_ifile : (*fr == '#') ? old_ifile : NULL_IFILE;
+			if (ifile == NULL_IFILE)
+				xcpy_char(&xp, *fr);
+			else
+				xcpy_filename(&xp, get_filename(ifile));
+		} else
+		{
+			xcpy_char(&xp, *fr);
+		}
+	}
+	xcpy_char(&xp, '\0');
+	return xp.copied;
+}
+
 /*
  * Expand a string, substituting any "%" with the current filename,
  * and any "#" with the previous filename.
@@ -293,89 +381,20 @@ public char * homefile(constant char *filename)
  */
 public char * fexpand(constant char *s)
 {
-	constant char *fr;
-	char *to;
 	size_t n;
 	char *e;
-	IFILE ifile;
-
-#define fchar_ifile(c) \
-	((c) == '%' ? curr_ifile : \
-	 (c) == '#' ? old_ifile : NULL_IFILE)
 
 	/*
 	 * Make one pass to see how big a buffer we 
 	 * need to allocate for the expanded string.
 	 */
-	n = 0;
-	for (fr = s;  *fr != '\0';  fr++)
-	{
-		switch (*fr)
-		{
-		case '%':
-		case '#':
-			if (fr > s && fr[-1] == *fr)
-			{
-				/*
-				 * Second (or later) char in a string
-				 * of identical chars.  Treat as normal.
-				 */
-				n++;
-			} else if (fr[1] != *fr)
-			{
-				/*
-				 * Single char (not repeated).  Treat specially.
-				 */
-				ifile = fchar_ifile(*fr);
-				if (ifile == NULL_IFILE)
-					n++;
-				else
-					n += strlen(get_filename(ifile));
-			}
-			/*
-			 * Else it is the first char in a string of
-			 * identical chars.  Just discard it.
-			 */
-			break;
-		default:
-			n++;
-			break;
-		}
-	}
-
-	e = (char *) ecalloc(n+1, sizeof(char));
+	n = fexpand_copy(s, NULL);
+	e = (char *) ecalloc(n, sizeof(char));
 
 	/*
 	 * Now copy the string, expanding any "%" or "#".
 	 */
-	to = e;
-	for (fr = s;  *fr != '\0';  fr++)
-	{
-		switch (*fr)
-		{
-		case '%':
-		case '#':
-			if (fr > s && fr[-1] == *fr)
-			{
-				*to++ = *fr;
-			} else if (fr[1] != *fr)
-			{
-				ifile = fchar_ifile(*fr);
-				if (ifile == NULL_IFILE)
-					*to++ = *fr;
-				else
-				{
-					strcpy(to, get_filename(ifile));
-					to += strlen(to);
-				}
-			}
-			break;
-		default:
-			*to++ = *fr;
-			break;
-		}
-	}
-	*to = '\0';
+	fexpand_copy(s, e);
 	return (e);
 }
 
@@ -445,10 +464,13 @@ public char * fcomplete(constant char *s)
 /*
  * Try to determine if a file is "binary".
  * This is just a guess, and we need not try too hard to make it accurate.
+ *
+ * The number of bytes read is returned to the caller, because it will
+ * be used later to compare to st_size from stat(2) to see if the file
+ * is lying about its size.
  */
-public int bin_file(int f)
+public int bin_file(int f, ssize_t *n)
 {
-	ssize_t n;
 	int bin_count = 0;
 	char data[256];
 	constant char* p;
@@ -458,10 +480,10 @@ public int bin_file(int f)
 		return (0);
 	if (less_lseek(f, (less_off_t)0, SEEK_SET) == BAD_LSEEK)
 		return (0);
-	n = read(f, data, sizeof(data));
-	if (n <= 0)
+	*n = read(f, data, sizeof(data));
+	if (*n <= 0)
 		return (0);
-	edata = &data[n];
+	edata = &data[*n];
 	for (p = data;  p < edata;  )
 	{
 		if (utf_mode && !is_utf8_well_formed(p, (int) ptr_diff(edata,p)))
@@ -474,7 +496,7 @@ public int bin_file(int f)
 			struct ansi_state *pansi;
 			if (ctldisp == OPT_ONPLUS && (pansi = ansi_start(c)) != NULL)
 			{
-				skip_ansi(pansi, &p, edata);
+				skip_ansi(pansi, c, &p, edata);
 				ansi_done(pansi);
 			} else if (binary_char(c))
 				bin_count++;
@@ -505,7 +527,7 @@ static POSITION seek_filesize(int f)
  * Read a string from a file.
  * Return a pointer to the string in memory.
  */
-static char * readfd(FILE *fd)
+public char * readfd(FILE *fd)
 {
 	struct xbuffer xbuf;
 	xbuf_init(&xbuf);
@@ -754,7 +776,7 @@ public char * lglob(constant char *afilename)
 /*
  * Does path not represent something in the file system?
  */
-public int is_fake_pathname(constant char *path)
+public lbool is_fake_pathname(constant char *path)
 {
 	return (strcmp(path, "-") == 0 ||
 	        strcmp(path, FAKE_HELPFILE) == 0 || strcmp(path, FAKE_EMPTYFILE) == 0);
@@ -768,9 +790,24 @@ public char * lrealpath(constant char *path)
 	if (!is_fake_pathname(path))
 	{
 #if HAVE_REALPATH
+		/*
+		 * Not all systems support the POSIX.1-2008 realpath() behavior
+		 * of allocating when passing a NULL argument. And PATH_MAX is
+		 * not required to be defined, or might contain an exceedingly
+		 * big value. We assume that if it is not defined (such as on
+		 * GNU/Hurd), then realpath() accepts NULL.
+		 */
+#ifndef PATH_MAX
+		char *rpath;
+
+		rpath = realpath(path, NULL);
+		if (rpath != NULL)
+			return (rpath);
+#else
 		char rpath[PATH_MAX];
 		if (realpath(path, rpath) != NULL)
 			return (save(rpath));
+#endif
 #endif
 	}
 	return (save(path));
@@ -875,7 +912,7 @@ public char * open_altfile(constant char *filename, int *pf, void **pfd)
 #if HAVE_FILENO
 	if (returnfd)
 	{
-		char c;
+		unsigned char c;
 		int f;
 
 		/*
@@ -941,7 +978,6 @@ public void close_altfile(constant char *altfilename, constant char *filename)
 	
 	if (!secure_allow(SF_LESSOPEN))
 		return;
-	ch_ungetchar(-1);
 	if ((lessclose = lgetenv("LESSCLOSE")) == NULL)
 		return;
 	if (num_pct_s(lessclose) > 2) 
@@ -966,9 +1002,9 @@ public void close_altfile(constant char *altfilename, constant char *filename)
 /*
  * Is the specified file a directory?
  */
-public int is_dir(constant char *filename)
+public lbool is_dir(constant char *filename)
 {
-	int isdir = 0;
+	lbool isdir = FALSE;
 
 #if HAVE_STAT
 {

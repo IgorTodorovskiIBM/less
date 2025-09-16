@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -50,7 +50,7 @@ extern int shift_count;
 extern long shift_count_fraction;
 extern int match_shift;
 extern long match_shift_fraction;
-extern char rscroll_char;
+extern LWCHAR rscroll_char;
 extern int rscroll_attr;
 extern int mousecap;
 extern int wheel_lines;
@@ -66,10 +66,13 @@ extern int chopline;
 extern int tabstops[];
 extern int ntabstops;
 extern int tabdefault;
+extern int no_paste;
 extern char intr_char;
 extern int nosearch_header_lines;
 extern int nosearch_header_cols;
 extern POSITION header_start_pos;
+extern char *init_header;
+extern char *first_cmd_at_prompt;
 #if LOGFILE
 extern char *namelogfile;
 extern lbool force_logfile;
@@ -85,15 +88,18 @@ extern constant char *ttyin_name;
 extern int is_tty;
 #endif /*LESSTEST*/
 #if MSDOS_COMPILER
-extern int nm_fg_color, nm_bg_color;
-extern int bo_fg_color, bo_bg_color;
-extern int ul_fg_color, ul_bg_color;
-extern int so_fg_color, so_bg_color;
-extern int bl_fg_color, bl_bg_color;
+extern int nm_fg_color, nm_bg_color, nm_attr;
+extern int bo_fg_color, bo_bg_color, bo_attr;
+extern int ul_fg_color, ul_bg_color, ul_attr;
+extern int so_fg_color, so_bg_color, so_attr;
+extern int bl_fg_color, bl_bg_color, bl_attr;
 extern int sgr_mode;
 #if MSDOS_COMPILER==WIN32C
 #ifndef COMMON_LVB_UNDERSCORE
 #define COMMON_LVB_UNDERSCORE 0x8000
+#endif
+#ifndef COMMON_LVB_REVERSE_VIDEO
+#define COMMON_LVB_REVERSE_VIDEO 0x4000
 #endif
 #endif
 #endif
@@ -524,7 +530,7 @@ public void opt__V(int type, constant char *s)
 		putstr(" regular expressions)\n");
 		{
 			char constant *copyright = 
-				"Copyright (C) 1984-2023  Mark Nudelman\n\n";
+				"Copyright (C) 1984-2025  Mark Nudelman\n\n";
 			putstr(copyright);
 		}
 		if (version[strlen(version)-1] == 'x')
@@ -549,40 +555,26 @@ public void opt__V(int type, constant char *s)
 /*
  * Parse an MSDOS color descriptor.
  */
-static void colordesc(constant char *s, int *fg_color, int *bg_color)
+static void colordesc(constant char *s, int *fg_color, int *bg_color, int *dattr)
 {
 	int fg, bg;
-#if MSDOS_COMPILER==WIN32C
-	int ul = 0;
- 
-	if (*s == 'u')
-	{
-		ul = COMMON_LVB_UNDERSCORE;
-		s++;
-		if (*s == '\0')
-		{
-			*fg_color = nm_fg_color | ul;
-			*bg_color = nm_bg_color;
-			return;
-		}
-	}
-#endif
-	if (parse_color(s, &fg, &bg) == CT_NULL)
+	CHAR_ATTR attr;
+	if (parse_color(s, &fg, &bg, &attr) == CT_NULL)
 	{
 		PARG p;
 		p.p_string = s;
 		error("Invalid color string \"%s\"", &p);
 	} else
 	{
-		if (fg == CV_NOCHANGE)
-			fg = nm_fg_color;
-		if (bg == CV_NOCHANGE)
-			bg = nm_bg_color;
-#if MSDOS_COMPILER==WIN32C
-		fg |= ul;
-#endif
 		*fg_color = fg;
 		*bg_color = bg;
+		*dattr = 0;
+#if MSDOS_COMPILER==WIN32C
+		if (attr & CATTR_UNDERLINE)
+			*dattr |= COMMON_LVB_UNDERSCORE;
+		if (attr & CATTR_STANDOUT)
+			*dattr |= COMMON_LVB_REVERSE_VIDEO;
+#endif
 	}
 }
 #endif
@@ -652,23 +644,24 @@ public void opt_D(int type, constant char *s)
 			switch (attr)
 			{
 			case AT_NORMAL:
-				colordesc(s, &nm_fg_color, &nm_bg_color);
+				colordesc(s, &nm_fg_color, &nm_bg_color, &nm_attr);
 				break;
 			case AT_BOLD:
-				colordesc(s, &bo_fg_color, &bo_bg_color);
+				colordesc(s, &bo_fg_color, &bo_bg_color, &bo_attr);
 				break;
 			case AT_UNDERLINE:
-				colordesc(s, &ul_fg_color, &ul_bg_color);
+				colordesc(s, &ul_fg_color, &ul_bg_color, &ul_attr);
 				break;
 			case AT_BLINK:
-				colordesc(s, &bl_fg_color, &bl_bg_color);
+				colordesc(s, &bl_fg_color, &bl_bg_color, &bl_attr);
 				break;
 			case AT_STANDOUT:
-				colordesc(s, &so_fg_color, &so_bg_color);
+				colordesc(s, &so_fg_color, &so_bg_color, &so_attr);
 				break;
 			}
 			if (type == TOGGLE)
 			{
+				init_win_colors();
 				at_enter(AT_STANDOUT);
 				at_exit();
 			}
@@ -815,8 +808,17 @@ public void opt_rscroll(int type, constant char *s)
 			rscroll_char = 0;
 		} else
 		{
-			rscroll_char = *fmt ? *fmt : '>';
 			rscroll_attr = attr|AT_COLOR_RSCROLL;
+			if (*fmt == '\0')
+				rscroll_char = '>';
+			else
+			{
+				LWCHAR ch = step_charc(&fmt, +1, fmt+strlen(fmt));
+				if (pwidth(ch, rscroll_attr, 0, 0) > 1)
+					error("cannot set rscroll to a wide character", NULL_PARG);
+				else
+					rscroll_char = ch;
+			}
 		}
 		break; }
 	case QUERY: {
@@ -973,6 +975,23 @@ public void opt_filesize(int type, constant char *s)
 }
 
 /*
+ * Handler for the --cmd option.
+ */
+	/*ARGSUSED*/
+public void opt_first_cmd_at_prompt(int type, constant char *s)
+{
+	switch (type)
+	{
+	case INIT:
+	case TOGGLE:
+		first_cmd_at_prompt = save(s);
+		break;
+	case QUERY:
+		break;
+	}
+}
+
+/*
  * Handler for the --intr option.
  */
 	/*ARGSUSED*/
@@ -1064,6 +1083,10 @@ public void opt_header(int type, constant char *s)
 	switch (type)
 	{
 	case INIT:
+		/* Can't call parse_header now because input file is not yet opened,
+		 * so find_pos won't work. */
+		init_header = save(s);
+		break;
 	case TOGGLE: {
 		int lines = header_lines;
 		int cols = header_cols;
@@ -1157,11 +1180,11 @@ static void do_nosearch_headers(int type, int no_header_lines, int no_header_col
 	switch (type)
 	{
 	case INIT:
-		break;
 	case TOGGLE:
 		nosearch_header_lines = no_header_lines;
 		nosearch_header_cols = no_header_cols;
-		break;
+		if (type != TOGGLE) break;
+		/*FALLTHRU*/
 	case QUERY:
 		if (nosearch_header_lines && nosearch_header_cols)
 			error("Search does not include header lines or columns", NULL_PARG);
@@ -1190,6 +1213,23 @@ public void opt_nosearch_header_lines(int type, constant char *s)
 public void opt_nosearch_header_cols(int type, constant char *s)
 {
 	do_nosearch_headers(type, 0, 1);
+}
+
+	/*ARGSUSED*/
+public void opt_no_paste(int type, constant char *s)
+{
+	switch (type)
+	{
+	case TOGGLE:
+		if (no_paste)
+			init_bracketed_paste();
+		else
+			deinit_bracketed_paste();
+        break;
+	case INIT:
+	case QUERY:
+		break;
+    }
 }
 
 #if LESSTEST

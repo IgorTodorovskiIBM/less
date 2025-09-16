@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -28,7 +28,11 @@ extern int sc_height;
 extern int jump_sline;
 extern int less_is_more;
 extern int header_lines;
+extern int utf_mode;
 extern IFILE curr_ifile;
+#if OSC8_LINK
+extern char *osc8_path;
+#endif
 #if EDITOR
 extern constant char *editor;
 extern constant char *editproto;
@@ -76,17 +80,41 @@ public void init_prompt(void)
 
 /*
  * Append a string to the end of the message.
+ * nprt means the character *may* be nonprintable
+ * and should be converted to printable form.
  */
+static void ap_estr(constant char *s, lbool nprt)
+{
+	constant char *es = s + strlen(s);
+	while (*s != '\0')
+	{
+		LWCHAR ch = step_charc(&s, +1, es);
+		constant char *ps;
+		char ubuf[MAX_UTF_CHAR_LEN+1];
+		size_t plen;
+
+		if (nprt)
+		{
+			ps = utf_mode ? prutfchar(ch) : prchar(ch);
+		} else
+		{
+			char *up = ubuf;
+			put_wchar(&up, ch);
+			*up = '\0';
+			ps = ubuf;
+		}
+		plen = strlen(ps);
+		if (mp + plen >= message + PROMPT_SIZE)
+			break;
+		strcpy(mp, ps);
+		mp += plen;
+	}
+	*mp = '\0';
+}
+
 static void ap_str(constant char *s)
 {
-	size_t len;
-
-	len = strlen(s);
-	if (mp + len >= message + PROMPT_SIZE)
-		len = ptr_diff(message, mp) + PROMPT_SIZE - 1;
-	strncpy(mp, s, len);
-	mp += len;
-	*mp = '\0';
+	ap_estr(s, FALSE);
 }
 
 /*
@@ -94,11 +122,10 @@ static void ap_str(constant char *s)
  */
 static void ap_char(char c)
 {
-	char buf[2];
-
-	buf[0] = c;
-	buf[1] = '\0';
-	ap_str(buf);
+	if (mp + 1 >= message + PROMPT_SIZE)
+		return;
+	*mp++ = c;
+	*mp = '\0';
 }
 
 /*
@@ -176,7 +203,7 @@ static lbool cond(char c, int where)
 	case 'c':
 		return (hshift != 0);
 	case 'e': /* At end of file? */
-		return (eof_displayed());
+		return (eof_displayed(FALSE));
 	case 'f': /* Filename known? */
 	case 'g':
 		return (strcmp(get_filename(curr_ifile), "-") != 0);
@@ -230,7 +257,6 @@ static void protochar(char c, int where)
 {
 	POSITION pos;
 	POSITION len;
-	int n;
 	LINENUM linenum;
 	LINENUM last_linenum;
 	IFILE h;
@@ -281,10 +307,10 @@ static void protochar(char c, int where)
 		break;
 #endif
 	case 'f': /* File name */
-		ap_str(get_filename(curr_ifile));
+		ap_estr(get_filename(curr_ifile), TRUE);
 		break;
 	case 'F': /* Last component of file name */
-		ap_str(last_component(get_filename(curr_ifile)));
+		ap_estr(last_component(get_filename(curr_ifile)), TRUE);
 		break;
 	case 'g': /* Shell-escaped file name */
 		s = shell_quote(get_filename(curr_ifile));
@@ -314,14 +340,22 @@ static void protochar(char c, int where)
 		else
 			ap_linenum(vlinenum(linenum-1));
 		break;
-	case 'm': /* Number of files */
+	case 'm': { /* Number of files */
 #if TAGS
-		n = ntags();
+		int n = ntags();
 		if (n)
 			ap_int(n);
 		else
 #endif
 			ap_int(nifile());
+		break; }
+	case 'o': /* path (URI without protocol) of selected OSC8 link */
+#if OSC8_LINK
+		if (osc8_path != NULL)
+			ap_str(osc8_path);
+		else
+#endif
+			ap_quest();
 		break;
 	case 'p': /* Percent into file (bytes) */
 		pos = curr_byte(where);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -36,6 +36,7 @@ extern IFILE curr_ifile;
 extern IFILE old_ifile;
 extern struct scrpos initial_scrpos;
 extern void *ml_examine;
+extern POSITION soft_eof;
 #if SPACES_IN_FILENAMES
 extern char openquote;
 extern char closequote;
@@ -441,6 +442,7 @@ public int edit_ifile(IFILE ifile)
 	IFILE was_curr_ifile;
 	char *p;
 	PARG parg;
+	ssize_t nread = 0;
 
 	if (ifile == curr_ifile)
 	{
@@ -530,7 +532,7 @@ public int edit_ifile(IFILE ifile)
 				error("%s", &parg);
 				free(p);
 				return edit_error(filename, alt_filename, altpipe, ifile);
-			} else if ((f = open(open_filename, OPEN_READ)) < 0)
+			} else if ((f = iopen(open_filename, OPEN_READ)) < 0)
 			{
 				/*
 				 * Got an error trying to open it.
@@ -543,7 +545,7 @@ public int edit_ifile(IFILE ifile)
 			} else 
 			{
 				chflags |= CH_CANSEEK;
-				if (!force_open && !opened(ifile) && bin_file(f))
+				if (bin_file(f, &nread) && !force_open && !opened(ifile))
 				{
 					/*
 					 * Looks like a binary file.  
@@ -603,11 +605,12 @@ public int edit_ifile(IFILE ifile)
 	 * Get the saved position for the file.
 	 */
 	curr_ifile = ifile;
+	soft_eof = NULL_POSITION;
 	set_altfilename(curr_ifile, alt_filename);
 	set_altpipe(curr_ifile, altpipe);
 	set_open(curr_ifile); /* File has been opened */
 	get_pos(curr_ifile, &initial_scrpos);
-	ch_init(f, chflags);
+	ch_init(f, chflags, nread);
 	consecutive_nulls = 0;
 	check_modelines();
 
@@ -655,6 +658,7 @@ public int edit_ifile(IFILE ifile)
 #if HILITE_SEARCH
 		clr_hilite();
 #endif
+		undo_osc8();
 		hshift = 0;
 		if (strcmp(filename, FAKE_HELPFILE) && strcmp(filename, FAKE_EMPTYFILE))
 		{

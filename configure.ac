@@ -1,6 +1,6 @@
 # Process this file with autoconf to produce a configure script.
 
-# Copyright (C) 1984-2023  Mark Nudelman
+# Copyright (C) 1984-2025  Mark Nudelman
 #
 # You may distribute under the terms of either the GNU General Public
 # License or the Less License, as specified in the README file.
@@ -36,7 +36,7 @@ AC_CHECK_LIB(termlib, tgetent, [have_termlib=yes], [have_termlib=no])
 AC_SEARCH_LIBS([regcmp], [gen intl PW])
 
 # Checks for header files.
-AC_CHECK_HEADERS_ONCE([ctype.h errno.h fcntl.h inttypes.h limits.h stdckdint.h stdio.h stdlib.h string.h termcap.h ncurses/termcap.h ncursesw/termcap.h termio.h termios.h time.h unistd.h values.h linux/magic.h sys/ioctl.h sys/stream.h sys/types.h sys/wait.h time.h wctype.h])
+AC_CHECK_HEADERS_ONCE([ctype.h errno.h fcntl.h inttypes.h limits.h stdckdint.h stdio.h stdlib.h string.h termcap.h ncurses/termcap.h ncursesw/termcap.h termio.h termios.h time.h unistd.h values.h sys/ioctl.h sys/stream.h sys/types.h sys/wait.h time.h wctype.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_HEADER_STAT
@@ -206,8 +206,6 @@ AH_TEMPLATE([HAVE_CONST],
 	[Define HAVE_CONST if your compiler supports the "const" modifier.])
 AH_TEMPLATE([HAVE_STAT_INO],
 	[Define HAVE_STAT_INO if your struct stat has st_ino and st_dev.])
-AH_TEMPLATE([HAVE_PROCFS],
-	[Define HAVE_PROCFS if have have fstatfs with f_type and PROC_SUPER_MAGIC.])
 AH_TEMPLATE([HAVE_TIME_T],
 	[Define HAVE_TIME_T if your system supports the "time_t" type.])
 AH_TEMPLATE([HAVE_STRERROR],
@@ -217,7 +215,9 @@ AH_TEMPLATE([HAVE_FILENO],
 AH_TEMPLATE([HAVE_ERRNO],
 	[Define HAVE_ERRNO if you have the errno variable.])
 AH_TEMPLATE([MUST_DEFINE_ERRNO],
-	[Define MUST_DEFINE_ERRNO if you have errno but it is not define in errno.h.])
+	[Define MUST_DEFINE_ERRNO if you have errno but it is not defined in errno.h.])
+AH_TEMPLATE([HAVE_SETTABLE_ERRNO],
+	[Define HAVE_SETTABLE_ERRNO if the errno variable can be assigned to.])
 AH_TEMPLATE([HAVE_SYS_ERRLIST],
 	[Define HAVE_SYS_ERRLIST if you have the sys_errlist[] variable.])
 AH_TEMPLATE([HAVE_OSPEED],
@@ -236,6 +236,8 @@ AH_TEMPLATE([HAVE_SIGSET_T],
 	[Define HAVE_SIGSET_T you have the sigset_t type.])
 AH_TEMPLATE([HAVE_SIGEMPTYSET],
 	[Define HAVE_SIGEMPTYSET if you have the sigemptyset macro.])
+AH_TEMPLATE([HAVE_SIGSETJMP],
+	[Define HAVE_SIGSETJMP if you have sigsetjmp and siglongjmp.])
 AH_TEMPLATE([EDIT_PGM],
 	[Define EDIT_PGM to your editor.])
 AH_TEMPLATE([SECURE_COMPILE],
@@ -251,11 +253,6 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <time.h>]], [[time_t t = 0;]])],[A
 AC_MSG_CHECKING(for st_ino in struct stat)
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <sys/types.h>
 #include <sys/stat.h>]], [[struct stat s; dev_t dev = s.st_dev; ino_t ino = s.st_ino;]])],[AC_MSG_RESULT(yes); AC_DEFINE(HAVE_STAT_INO)],[AC_MSG_RESULT(no)])
-AC_MSG_CHECKING(for procfs)
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <sys/statfs.h>
-#if HAVE_LINUX_MAGIC_H
-#include <linux/magic.h>
-#endif]], [[struct statfs s; s.f_type = PROC_SUPER_MAGIC; (void) fstatfs(0,&s); ]])],[AC_MSG_RESULT(yes); AC_DEFINE(HAVE_PROCFS)],[AC_MSG_RESULT(no)])
 
 # Checks for ANSI function prototypes.
 AC_MSG_CHECKING(for ANSI function prototypes)
@@ -263,6 +260,7 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[int f(int a) { return a; }]])],[AC_MS
 
 # Checks for library functions.
 AC_CHECK_FUNCS([fchmod fsync nanosleep poll popen realpath _setjmp sigprocmask sigsetmask snprintf stat strsignal system ttyname usleep])
+AC_CHECK_DECL(sigsetjmp, [AC_DEFINE(HAVE_SIGSETJMP)], [], [#include <setjmp.h>])
 
 # AC_CHECK_FUNCS may not work for inline functions, so test these separately.
 AC_MSG_CHECKING(for memcpy)
@@ -327,6 +325,17 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
 #endif]], [[extern int errno; static int x; x = errno;]])],[AC_MSG_RESULT(yes - must define); AC_DEFINE(HAVE_ERRNO) AC_DEFINE(MUST_DEFINE_ERRNO)],[AC_MSG_RESULT(no)])
 fi
 
+have_settable_errno=no
+if test $have_errno = yes; then
+AC_MSG_CHECKING(for settable errno)
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#if HAVE_ERRNO_H
+#include <errno.h>
+#else
+extern int errno;
+#endif]], [[errno = 0;]])],[AC_MSG_RESULT(yes); AC_DEFINE(HAVE_SETTABLE_ERRNO)],[])
+fi
+
 AC_MSG_CHECKING(for locale)
 AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <locale.h>
 #include <ctype.h>
@@ -358,10 +367,11 @@ fi
 
 # Compile in secure mode?
 AC_ARG_WITH(secure,
-  [  --with-secure           Compile in secure mode],
+  [  --with-secure           Compile in secure mode])
+AS_IF([test "x$with_secure" = "xyes"],[
   AC_DEFINE(SECURE_COMPILE, 1)
-  AC_SUBST(SECURE_COMPILE,1), AC_DEFINE(SECURE_COMPILE, 0)
-  AC_SUBST(SECURE_COMPILE,0))
+  AC_SUBST(SECURE_COMPILE,1)], [AC_DEFINE(SECURE_COMPILE, 0)
+  AC_SUBST(SECURE_COMPILE,0)])
 
 # Checks for regular expression functions.
 have_regex=no
@@ -561,6 +571,12 @@ AH_TOP([
 #define	LOGFILE		(!SECURE)
 
 /*
+ * OSC8_SEARCH is 1 if you wish to allow the ^O^O and related commands
+ * (to open OSC8 hyperlinks).
+ */
+#define OSC8_LINK	1
+
+/*
  * GNU_OPTIONS is 1 if you wish to support the GNU-style command
  * line options --help and --version.
  */
@@ -588,9 +604,18 @@ AH_TOP([
 #define	LESSKEYINFILE_SYS	SYSDIR "/syslesskey"
 #define LESSHISTFILE		".lesshst"
 
+/* Autodetect mingw */
+#if defined(__MINGW32__)
+/*
+ * Define MSDOS_COMPILER if compiling under Microsoft C.
+ */
+#define	MSDOS_COMPILER	WIN32C
 
-/* Settings always true on Unix.  */
-
+/*
+ * Pathname separator character.
+ */
+#define	PATHNAME_SEP	"\\"
+#else
 /*
  * Define MSDOS_COMPILER if compiling under Microsoft C.
  */
@@ -600,6 +625,9 @@ AH_TOP([
  * Pathname separator character.
  */
 #define	PATHNAME_SEP	"/"
+#endif
+
+/* Settings always true on Unix.  */
 
 /*
  * The value returned from tgetent on success.
@@ -674,6 +702,7 @@ AH_TOP([
 #define	TERMSBUF_SIZE	1024	/* Buffer to hold termcap strings */
 #define	TAGLINE_SIZE	512	/* Max size of line in tags file */
 #define	TABSTOP_MAX	32	/* Max number of custom tab stops */
+#define LINENUM_POOL    200     /* Size of line number pool */
 #else /* more reasonable sizes for modern machines */
 #define	CMDBUF_SIZE	2048	/* Buffer for multichar commands */
 #define	UNGOT_SIZE	200	/* Max chars to unget() */
@@ -684,6 +713,7 @@ AH_TOP([
 #define	TERMSBUF_SIZE	1024	/* Buffer to hold termcap strings */
 #define	TAGLINE_SIZE	1024	/* Max size of line in tags file */
 #define	TABSTOP_MAX	128	/* Max number of custom tab stops */
+#define LINENUM_POOL    1024    /* Size of line number pool */
 #endif
 
 /* Define as the return type of signal handlers (int or void).  */

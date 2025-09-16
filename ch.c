@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -18,13 +18,6 @@
 #if MSDOS_COMPILER==WIN32C
 #include <errno.h>
 #include <windows.h>
-#endif
-
-#if HAVE_PROCFS
-#include <sys/statfs.h>
-#if HAVE_LINUX_MAGIC_H
-#include <linux/magic.h>
-#endif
 #endif
 
 typedef POSITION BLOCKNUM;
@@ -156,10 +149,7 @@ static int ch_get(void)
 	struct buf *bp;
 	struct bufnode *bn;
 	ssize_t n;
-	lbool read_again;
 	int h;
-	POSITION pos;
-	POSITION len;
 
 	if (thisfile == NULL)
 		return (EOI);
@@ -231,12 +221,28 @@ static int ch_get(void)
 
 	for (;;)
 	{
-		pos = ch_position(ch_block, bp->datasize);
+		lbool read_again;
+		POSITION len;
+		POSITION pos = ch_position(ch_block, bp->datasize);
+		lbool read_pipe_at_eof = FALSE;
 		if ((len = ch_length()) != NULL_POSITION && pos >= len)
+		{
 			/*
-			 * At end of file.
+			 * Apparently at end of file.
+			 * Double-check the file size in case it has changed.
 			 */
-			return (EOI);
+			ch_resize();
+			if ((len = ch_length()) != NULL_POSITION && pos >= len)
+			{
+				if (ch_flags & (CH_CANSEEK|CH_HELPFILE))
+					return (EOI);
+				/* ch_length doesn't work for pipes, so just try to
+				 * read from the pipe to see if more data has appeared.
+				 * This can happen only in limited situations, such as
+				 * a fifo that the writer has closed and reopened. */
+				read_pipe_at_eof = TRUE;
+			}
+		}
 
 		if (pos != ch_fpos)
 		{
@@ -277,10 +283,7 @@ static int ch_get(void)
 
 		read_again = FALSE;
 		if (n == READ_INTR)
-		{
-			ch_fsize = pos;
 			return (EOI);
-		}
 		if (n == READ_AGAIN)
 		{
 			read_again = TRUE;
@@ -311,6 +314,8 @@ static int ch_get(void)
 
 		ch_fpos += n;
 		bp->datasize += (size_t) n;
+		if (read_pipe_at_eof)
+			ch_set_eof(); /* update length of pipe */
 
 		if (n == 0)
 		{
@@ -337,6 +342,9 @@ static int ch_get(void)
 				return (EOI);
 			}
 			if (sigs)
+				return (EOI);
+			if (read_pipe_at_eof)
+				/* No new data; we are still at EOF on the pipe. */
 				return (EOI);
 		}
 
@@ -407,6 +415,8 @@ public void end_logfile(void)
 	logfile = -1;
 	free(namelogfile);
 	namelogfile = NULL;
+	putstr("\n");
+	flush();
 }
 
 /*
@@ -419,6 +429,7 @@ public void sync_logfile(void)
 	struct buf *bp;
 	struct bufnode *bn;
 	lbool warned = FALSE;
+	int h;
 	BLOCKNUM block;
 	BLOCKNUM nblocks;
 
@@ -428,7 +439,8 @@ public void sync_logfile(void)
 	for (block = 0;  block < nblocks;  block++)
 	{
 		lbool wrote = FALSE;
-		FOR_BUFS(bn)
+		h = BUFHASH(block);
+		FOR_BUFS_IN_CHAIN(h, bn)
 		{
 			bp = bufnode_buf(bn);
 			if (bp->block == block)
@@ -607,6 +619,20 @@ public POSITION ch_length(void)
 }
 
 /*
+ * Update the file size, in case it has changed.
+ */
+public void ch_resize(void)
+{
+	POSITION fsize;
+
+	if (!(ch_flags & CH_CANSEEK))
+		return;
+	fsize = filesize(ch_file);
+	if (fsize != NULL_POSITION)
+		ch_fsize = fsize;
+}
+
+/*
  * Return the current position in the file.
  */
 public POSITION ch_tell(void)
@@ -705,37 +731,20 @@ public void ch_flush(void)
 	}
 
 	/*
-	 * Figure out the size of the file, if we can.
-	 */
-	ch_fsize = filesize(ch_file);
-
-	/*
 	 * Seek to a known position: the beginning of the file.
 	 */
 	ch_fpos = 0;
 	ch_block = 0; /* ch_fpos / LBUFSIZE; */
 	ch_offset = 0; /* ch_fpos % LBUFSIZE; */
 
-#if HAVE_PROCFS
-	/*
-	 * This is a kludge to workaround a Linux kernel bug: files in
-	 * /proc have a size of 0 according to fstat() but have readable 
-	 * data.  They are sometimes, but not always, seekable.
-	 * Force them to be non-seekable here.
-	 */
-	if (ch_fsize == 0)
+	if (ch_flags & CH_NOTRUSTSIZE)
 	{
-		struct statfs st;
-		if (fstatfs(ch_file, &st) == 0)
-		{
-			if (st.f_type == PROC_SUPER_MAGIC)
-			{
-				ch_fsize = NULL_POSITION;
-				ch_flags &= ~CH_CANSEEK;
-			}
-		}
+		ch_fsize = NULL_POSITION;
+		ch_flags &= ~CH_CANSEEK;
+	} else
+	{
+		ch_fsize = (ch_flags & CH_HELPFILE) ? size_helpdata : filesize(ch_file);
 	}
-#endif
 
 	if (less_lseek(ch_file, (less_off_t)0, SEEK_SET) == BAD_LSEEK)
 	{
@@ -837,7 +846,7 @@ public void ch_set_eof(void)
 /*
  * Initialize file state for a new file.
  */
-public void ch_init(int f, int flags)
+public void ch_init(int f, int flags, ssize_t nread)
 {
 	/*
 	 * See if we already have a filestate for this file.
@@ -868,6 +877,22 @@ public void ch_init(int f, int flags)
 	}
 	if (thisfile->file == -1)
 		thisfile->file = f;
+
+	/*
+	 * Figure out the size of the file, if we can.
+	 */
+	ch_fsize = (flags & CH_HELPFILE) ? size_helpdata : filesize(ch_file);
+
+	/*
+	 * This is a kludge to workaround a Linux kernel bug: files in some
+	 * pseudo filesystems like /proc and tracefs have a size of 0 according
+	 * to fstat() but have readable data.
+	 */
+	if (ch_fsize == 0 && nread > 0)
+	{
+		ch_flags |= CH_NOTRUSTSIZE;
+	}
+
 	ch_flush();
 }
 

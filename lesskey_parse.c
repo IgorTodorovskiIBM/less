@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -34,11 +34,14 @@ static constant struct lesskey_cmdname cmdnames[] =
 	{ "back-bracket",         A_B_BRACKET },
 	{ "back-line",            A_B_LINE },
 	{ "back-line-force",      A_BF_LINE },
+	{ "back-newline",         A_B_NEWLINE },
 	{ "back-screen",          A_B_SCREEN },
+	{ "back-screen-force",    A_BF_SCREEN },
 	{ "back-scroll",          A_B_SCROLL },
 	{ "back-search",          A_B_SEARCH },
 	{ "back-window",          A_B_WINDOW },
 	{ "clear-mark",           A_CLRMARK },
+	{ "clear-search",         A_CLR_SEARCH },
 	{ "debug",                A_DEBUG },
 	{ "digit",                A_DIGIT },
 	{ "display-flag",         A_DISP_OPTION },
@@ -52,13 +55,14 @@ static constant struct lesskey_cmdname cmdnames[] =
 	{ "flush-repaint",        A_FREPAINT },
 	{ "forw-bracket",         A_F_BRACKET },
 	{ "forw-forever",         A_F_FOREVER },
-	{ "forw-until-hilite",    A_F_UNTIL_HILITE },
 	{ "forw-line",            A_F_LINE },
 	{ "forw-line-force",      A_FF_LINE },
+	{ "forw-newline",         A_F_NEWLINE },
 	{ "forw-screen",          A_F_SCREEN },
 	{ "forw-screen-force",    A_FF_SCREEN },
 	{ "forw-scroll",          A_F_SCROLL },
 	{ "forw-search",          A_F_SEARCH },
+	{ "forw-until-hilite",    A_F_UNTIL_HILITE },
 	{ "forw-window",          A_F_WINDOW },
 	{ "goto-end",             A_GOEND },
 	{ "goto-end-buffered",    A_GOEND_BUF },
@@ -68,14 +72,20 @@ static constant struct lesskey_cmdname cmdnames[] =
 	{ "index-file",           A_INDEX_FILE },
 	{ "invalid",              A_UINVALID },
 	{ "left-scroll",          A_LSHIFT },
+	{ "mouse",                A_X11MOUSE_IN },
+	{ "mouse6",               A_X116MOUSE_IN },
 	{ "next-file",            A_NEXT_FILE },
 	{ "next-tag",             A_NEXT_TAG },
-	{ "noaction",             A_NOACTION },
 	{ "no-scroll",            A_LLSHIFT },
+	{ "noaction",             A_NOACTION },
+	{ "osc8-forw-search",     A_OSC8_F_SEARCH },
+	{ "osc8-back-search",     A_OSC8_B_SEARCH },
+	{ "osc8-open",            A_OSC8_OPEN },
 	{ "percent",              A_PERCENT },
 	{ "pipe",                 A_PIPE },
 	{ "prev-file",            A_PREV_FILE },
 	{ "prev-tag",             A_PREV_TAG },
+	{ "pshell",               A_PSHELL },
 	{ "quit",                 A_QUIT },
 	{ "remove-file",          A_REMOVE_FILE },
 	{ "repaint",              A_REPAINT },
@@ -88,12 +98,10 @@ static constant struct lesskey_cmdname cmdnames[] =
 	{ "set-mark",             A_SETMARK },
 	{ "set-mark-bottom",      A_SETMARKBOT },
 	{ "shell",                A_SHELL },
-	{ "pshell",               A_PSHELL },
 	{ "status",               A_STAT },
 	{ "toggle-flag",          A_OPT_TOGGLE },
 	{ "toggle-option",        A_OPT_TOGGLE },
 	{ "undo-hilite",          A_UNDO_SEARCH },
-	{ "clear-search",         A_CLR_SEARCH },
 	{ "version",              A_VERSION },
 	{ "visual",               A_VISUAL },
 	{ NULL,   0 }
@@ -115,6 +123,8 @@ static constant struct lesskey_cmdname editnames[] =
 	{ "abort",              EC_ABORT },
 	{ "left",               EC_LEFT },
 	{ "literal",            EC_LITERAL },
+	{ "mouse",              EC_X11MOUSE },
+	{ "mouse6",             EC_X116MOUSE },
 	{ "right",              EC_RIGHT },
 	{ "up",                 EC_UP },
 	{ "word-backspace",     EC_W_BACKSPACE },
@@ -616,13 +626,14 @@ static void parse_line(char *line, struct lesskey_tables *tables)
 /*
  * Parse a lesskey source file and store result in tables.
  */
-int parse_lesskey(constant char *ainfile, struct lesskey_tables *tables)
+int parse_lesskey(constant char *infile, struct lesskey_tables *tables)
 {
 	FILE *desc;
 	char line[1024];
-	char *infile = (ainfile != NULL) ? strdup(ainfile) : homefile(DEF_LESSKEYINFILE);
-	if (lesskey_file != NULL) free(lesskey_file);
-	lesskey_file = infile;
+
+	lesskey_file = (infile != NULL) ? strdup(infile) : homefile(DEF_LESSKEYINFILE);
+	if (lesskey_file == NULL)
+		return (-1);
 
 	init_tables(tables);
 	errors = 0;
@@ -633,24 +644,29 @@ int parse_lesskey(constant char *ainfile, struct lesskey_tables *tables)
 	/*
 	 * Open the input file.
 	 */
-	if (strcmp(infile, "-") == 0)
+	if (strcmp(lesskey_file, "-") == 0)
 		desc = stdin;
-	else if ((desc = fopen(infile, "r")) == NULL)
+	else if ((desc = fopen(lesskey_file, "r")) == NULL)
 	{
-		/* parse_error("cannot open lesskey file %s", infile); */
-		return (-1);
+		/* parse_error("cannot open lesskey file %s", lesskey_file); */
+		errors = -1;
 	}
-	free(infile);
 
 	/*
 	 * Read and parse the input file, one line at a time.
 	 */
-	while (fgets(line, sizeof(line), desc) != NULL)
+	if (desc != NULL)
 	{
-		++linenum;
-		parse_line(line, tables);
+		while (fgets(line, sizeof(line), desc) != NULL)
+		{
+			++linenum;
+			parse_line(line, tables);
+		}
+		if (desc != stdin)
+			fclose(desc);
 	}
-	fclose(desc);
+	free(lesskey_file);
+	lesskey_file = NULL;
 	return (errors);
 }
 
@@ -661,6 +677,7 @@ int parse_lesskey_content(constant char *content, struct lesskey_tables *tables)
 {
 	size_t cx = 0;
 
+	lesskey_file = "lesskey-content";
 	init_tables(tables);
 	errors = 0;
 	linenum = 0;
@@ -684,5 +701,6 @@ int parse_lesskey_content(constant char *content, struct lesskey_tables *tables)
 		parse_line(line, tables);
 		if (content[cx] != '\0') ++cx; /* skip newline or semicolon */
 	}
+	lesskey_file = NULL;
 	return (errors);
 }

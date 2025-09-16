@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 1984-2023  Mark Nudelman
+ * Copyright (C) 1984-2025  Mark Nudelman
  *
  * You may distribute under the terms of either the GNU General Public
  * License or the Less License, as specified in the README file.
@@ -689,7 +689,7 @@ static POSITION gtagsearch(void)
  * |func     21      subr.c         func(arg)
  *
  * The following commands write this format.
- *      o Traditinal Ctags with -x option
+ *      o Traditional Ctags with -x option
  *      o Global with -x option
  *              See <http://www.gnu.org/software/global/global.html>
  *
